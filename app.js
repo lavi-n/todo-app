@@ -301,8 +301,19 @@ function App() {
   const [newTagColor, setNewTagColor] = useState('#3b82f6');
   const [snoozeOpen, setSnoozeOpen] = useState({});
   const [toast, setToast] = useState(null); // null | { message, onUndo }
+  const [user, setUser] = useState(null); // null (signed out) | Firebase user object
+  const [authChecked, setAuthChecked] = useState(false); // avoids a sign-in-button flash on load
   const toastTimer = useRef(null);
   const loaded = useRef(false);
+  const userRef = useRef(null); // mirrors `user`, readable inside the load/save effects below
+
+  function signIn() {
+    firebase.auth().signInWithPopup(new firebase.auth.GoogleAuthProvider())
+      .catch(err => showToast('Sign-in failed: ' + err.message));
+  }
+  function signOutUser() {
+    firebase.auth().signOut();
+  }
 
   function showToast(message, onUndo) {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -314,25 +325,49 @@ function App() {
     setToast(null);
   }
 
-  // Load once on mount, then keep saving to this browser's own storage.
+  // Reload whenever auth state changes: signed out -> this browser's localStorage,
+  // signed in -> that user's Firestore document (so tasks follow them across devices).
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem('todo-tasks');
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) { setTasks(parsed); } // old format, pre-trash/tags
-        else {
-          setTasks(parsed.tasks || []);
-          setTrash(parsed.trash || []);
-          if (parsed.tags) setTags(parsed.tags);
+    const unsub = firebase.auth().onAuthStateChanged(async (u) => {
+      loaded.current = false; // pause the save effect below while we load
+      userRef.current = u;
+      setUser(u);
+      try {
+        if (u) {
+          const snap = await firebase.firestore().collection('users').doc(u.uid).get();
+          const data = snap.exists ? snap.data() : null;
+          setTasks((data && data.tasks) || []);
+          setTrash((data && data.trash) || []);
+          if (data && data.tags) setTags(data.tags);
+        } else {
+          const raw = localStorage.getItem('todo-tasks');
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) { setTasks(parsed); setTrash([]); } // old format, pre-trash/tags
+            else {
+              setTasks(parsed.tasks || []);
+              setTrash(parsed.trash || []);
+              if (parsed.tags) setTags(parsed.tags);
+            }
+          } else {
+            setTasks([]);
+            setTrash([]);
+          }
         }
-      }
-    } catch (e) {}
-    loaded.current = true;
+      } catch (e) {}
+      loaded.current = true;
+      setAuthChecked(true);
+    });
+    return unsub;
   }, []);
   useEffect(() => {
     if (!loaded.current) return;
-    try { localStorage.setItem('todo-tasks', JSON.stringify({ tasks, trash, tags })); } catch (e) {}
+    const payload = { tasks, trash, tags };
+    if (userRef.current) {
+      firebase.firestore().collection('users').doc(userRef.current.uid).set(payload).catch(() => {});
+    } else {
+      try { localStorage.setItem('todo-tasks', JSON.stringify(payload)); } catch (e) {}
+    }
   }, [tasks, trash, tags]);
 
   const activeTheme = THEMES.find(t => t.id === themeId);
@@ -544,6 +579,29 @@ function App() {
       return kept.length === prev.length ? prev : kept;
     });
   }, [trash]);
+
+  // Gate the whole app behind auth: nothing renders until we know the sign-in
+  // state, and signed-out users see a dedicated login page instead of the app.
+  if (!authChecked) {
+    return h('div', { className: 'auth-loading' }, 'Loading\u2026');
+  }
+  if (!user) {
+    return h('div', { className: 'login-page' },
+      h('div', { className: 'login-card' },
+        h('h1', { className: 'login-title' }, 'To Do'),
+        h('p', { className: 'login-subtitle' }, 'Sign in to keep your tasks synced across devices.'),
+        h('button', { className: 'login-google-btn', onClick: signIn },
+          h('svg', { viewBox: '0 0 48 48', className: 'google-logo' },
+            h('path', { fill: '#EA4335', d: 'M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z' }),
+            h('path', { fill: '#4285F4', d: 'M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.9-2.26 5.36-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z' }),
+            h('path', { fill: '#FBBC05', d: 'M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z' }),
+            h('path', { fill: '#34A853', d: 'M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z' })
+          ),
+          'Sign in with Google'
+        )
+      )
+    );
+  }
 
   const visible = sortTasks((view === 'done' ? tasks.filter(t => t.done)
     : view === 'important' ? tasks.filter(t => t.important && !t.done)
@@ -957,6 +1015,13 @@ function App() {
         className: 'nav-btn' + (view === item.key ? ' active' : ''),
         onClick: () => setView(item.key)
       }, Icon(item.svg), item.label, item.count > 0 ? h('span', { className: 'nav-count' }, item.count) : null)),
+      h('div', { className: 'account-panel' },
+        h('button', { className: 'account-btn', title: 'Sign out of ' + (user.email || 'Google'), onClick: signOutUser },
+          user.photoURL ? h('img', { src: user.photoURL, className: 'account-avatar', referrerPolicy: 'no-referrer' }) : null,
+          h('span', { className: 'account-name' }, user.displayName || user.email || 'Signed in'),
+          h('span', { className: 'account-signout' }, 'Sign out')
+        )
+      ),
       h('div', { className: 'theme-panel' },
         h('div', { className: 'theme-row-top' },
           h('span', { className: 'theme-label' }, 'Theme'),
